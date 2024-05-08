@@ -107,6 +107,10 @@ func GenerateRandomBlockCustom(config *BlockConfig) (*Block, ed25519.PrivKey) {
 
 // GetRandomNextBlock returns a block with random data and height of +1 from the provided block
 func GetRandomNextBlock(block *Block, privKey ed25519.PrivKey, appHash header.Hash, nTxs int) *Block {
+	// check if the block is nil and return
+	if block == nil {
+		return nil
+	}
 	nextBlock := getBlockDataWith(nTxs)
 	dataHash, err := nextBlock.Data.Hash()
 	if err != nil {

@@ -101,3 +101,31 @@ func TestGetNodeKey(t *testing.T) {
 		})
 	}
 }
+
+func TestGetRandomBlock(t *testing.T) {
+	// Generate 10 random blocks sets and check that they are all unique
+	// by comparing it's block hashes
+
+	blockSetHash := make(map[string]bool)
+	for i := 0; i < 10; i++ {
+		block := GetRandomBlock(uint64(i), i)
+
+		blockHash := string(block.Hash())
+		if _, ok := blockSetHash[blockHash]; ok {
+			t.Errorf("Duplicate blocks generated: %v", blockHash)
+		}
+		blockSetHash[blockHash] = true
+	}
+}
+
+func TestGetRandomNextBlock(t *testing.T) {
+	privKey := ed25519.GenPrivKey()
+	// gerenerate a random block and compare the generated next block height
+	block := GetRandomBlock(uint64(1), 1)
+	nextblock := GetRandomNextBlock(block, privKey, block.Hash(), 10)
+	assert.Equal(t, uint64(2), nextblock.Height())
+
+	// genretae a random next block by passing empty block details
+	nextblock = GetRandomNextBlock(nil, privKey, block.Hash(), 10)
+	assert.Nil(t, nextblock)
+}
