@@ -11,26 +11,27 @@ import (
 	"testing"
 	"time"
 
+	abci "github.com/cometbft/cometbft/abci/types"
 	cmconfig "github.com/cometbft/cometbft/config"
+	cmproto "github.com/cometbft/cometbft/proto/tendermint/types"
 	"github.com/cometbft/cometbft/proxy"
-
-	goDA "github.com/rollkit/go-da"
-	"github.com/rollkit/rollkit/config"
-	test "github.com/rollkit/rollkit/test/log"
+	cmtypes "github.com/cometbft/cometbft/types"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
-	abci "github.com/cometbft/cometbft/abci/types"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 
 	testutils "github.com/celestiaorg/utils/test"
 
+	goDA "github.com/rollkit/go-da"
 	"github.com/rollkit/rollkit/block"
+	"github.com/rollkit/rollkit/config"
 	"github.com/rollkit/rollkit/da"
 	"github.com/rollkit/rollkit/mempool"
+	test "github.com/rollkit/rollkit/test/log"
 	"github.com/rollkit/rollkit/test/mocks"
 	"github.com/rollkit/rollkit/types"
 )
@@ -49,10 +50,9 @@ func TestMempoolDirectly(t *testing.T) {
 	require.IsType(t, new(FullNode), fn)
 
 	node := fn.(*FullNode)
-	assert := assert.New(t)
-	peerID := getPeerID(assert)
-	verifyTransactions(node, peerID, assert)
-	verifyMempoolSize(node, assert)
+	peerID := getPeerID(t)
+	verifyTransactions(node, peerID, t)
+	verifyMempoolSize(node, t)
 }
 
 // Tests that the node is able to sync multiple blocks even if blocks arrive out of order
@@ -263,6 +263,63 @@ func TestPendingBlocks(t *testing.T) {
 
 }
 
+func TestVoteExtension(t *testing.T) {
+	require := require.New(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	const voteExtensionEnableHeight = 5
+	const expectedExtension = "vote extension from height %d"
+
+	// Create & configure node with app. Get signing key for mock functions.
+	app := &mocks.Application{}
+	app.On("InitChain", mock.Anything, mock.Anything).Return(&abci.ResponseInitChain{}, nil)
+	node, signingKey := createAggregatorWithApp(ctx, app, voteExtensionEnableHeight, t)
+	require.NotNil(node)
+	require.NotNil(signingKey)
+
+	prepareProposalVoteExtChecker := func(_ context.Context, req *abci.RequestPrepareProposal) (*abci.ResponsePrepareProposal, error) {
+		if req.Height <= voteExtensionEnableHeight {
+			require.Empty(req.LocalLastCommit.Votes)
+		} else {
+			require.Len(req.LocalLastCommit.Votes, 1)
+			extendedCommit := req.LocalLastCommit.Votes[0]
+			require.NotNil(extendedCommit)
+			require.Equal(extendedCommit.BlockIdFlag, cmproto.BlockIDFlagCommit)
+			// during PrepareProposal at height h, vote extensions from previous block (h-1) is available
+			require.Equal([]byte(fmt.Sprintf(expectedExtension, req.Height-1)), extendedCommit.VoteExtension)
+			require.NotNil(extendedCommit.Validator)
+			require.NotNil(extendedCommit.Validator.Address)
+			require.NotEmpty(extendedCommit.ExtensionSignature)
+			ok, err := signingKey.GetPublic().Verify(extendedCommit.VoteExtension, extendedCommit.ExtensionSignature)
+			require.NoError(err)
+			require.True(ok)
+		}
+		return &abci.ResponsePrepareProposal{
+			Txs: req.Txs,
+		}, nil
+	}
+
+	voteExtension := func(_ context.Context, req *abci.RequestExtendVote) (*abci.ResponseExtendVote, error) {
+		return &abci.ResponseExtendVote{
+			VoteExtension: []byte(fmt.Sprintf(expectedExtension, req.Height)),
+		}, nil
+	}
+
+	app.On("Commit", mock.Anything, mock.Anything).Return(&abci.ResponseCommit{}, nil)
+	app.On("PrepareProposal", mock.Anything, mock.Anything).Return(prepareProposalVoteExtChecker)
+	app.On("ProcessProposal", mock.Anything, mock.Anything).Return(&abci.ResponseProcessProposal{Status: abci.ResponseProcessProposal_ACCEPT}, nil)
+	app.On("FinalizeBlock", mock.Anything, mock.Anything).Return(finalizeBlockResponse)
+	app.On("ExtendVote", mock.Anything, mock.Anything).Return(voteExtension)
+	require.NotNil(app)
+
+	require.NoError(node.Start())
+	require.NoError(waitForAtLeastNBlocks(node, 10, Store))
+	require.NoError(node.Stop())
+	app.AssertExpectations(t)
+}
+
 func createAggregatorWithPersistence(ctx context.Context, dbPath string, dalc *da.DAClient, t *testing.T) (Node, *mocks.Application) {
 	t.Helper()
 
@@ -303,6 +360,46 @@ func createAggregatorWithPersistence(ctx context.Context, dbPath string, dalc *d
 	return fullNode, app
 }
 
+func createAggregatorWithApp(ctx context.Context, app abci.Application, voteExtensionEnableHeight int64, t *testing.T) (Node, crypto.PrivKey) {
+	t.Helper()
+
+	key, _, _ := crypto.GenerateEd25519Key(rand.Reader)
+	genesis, genesisValidatorKey := types.GetGenesisWithPrivkey()
+	genesis.ConsensusParams = &cmtypes.ConsensusParams{
+		Block:     cmtypes.DefaultBlockParams(),
+		Evidence:  cmtypes.DefaultEvidenceParams(),
+		Validator: cmtypes.DefaultValidatorParams(),
+		Version:   cmtypes.DefaultVersionParams(),
+		ABCI:      cmtypes.ABCIParams{VoteExtensionsEnableHeight: voteExtensionEnableHeight},
+	}
+	signingKey, err := types.PrivKeyToSigningKey(genesisValidatorKey)
+	require.NoError(t, err)
+
+	node, err := NewNode(
+		ctx,
+		config.NodeConfig{
+			DAAddress:   MockDAAddress,
+			DANamespace: MockDANamespace,
+			Aggregator:  true,
+			BlockManagerConfig: config.BlockManagerConfig{
+				BlockTime:   100 * time.Millisecond,
+				DABlockTime: 300 * time.Millisecond,
+			},
+			Light: false,
+		},
+		key,
+		signingKey,
+		proxy.NewLocalClientCreator(app),
+		genesis,
+		DefaultMetricsProvider(cmconfig.DefaultInstrumentationConfig()),
+		test.NewFileLoggerCustom(t, test.TempLogFileName(t, "")),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, node)
+
+	return node, signingKey
+}
+
 // setupMockApplication initializes a mock application
 func setupMockApplication() *mocks.Application {
 	app := &mocks.Application{}
@@ -325,28 +422,29 @@ func generateSingleKey() crypto.PrivKey {
 }
 
 // getPeerID generates a peer ID
-func getPeerID(assert *assert.Assertions) peer.ID {
+func getPeerID(t *testing.T) peer.ID {
 	key := generateSingleKey()
 
 	peerID, err := peer.IDFromPrivateKey(key)
-	assert.NoError(err)
+	assert.NoError(t, err)
 	return peerID
 }
 
 // verifyTransactions checks if transactions are valid
-func verifyTransactions(node *FullNode, peerID peer.ID, assert *assert.Assertions) {
+func verifyTransactions(node *FullNode, peerID peer.ID, t *testing.T) {
 	transactions := []string{"tx1", "tx2", "tx3", "tx4"}
 	for _, tx := range transactions {
 		err := node.Mempool.CheckTx([]byte(tx), func(r *abci.ResponseCheckTx) {}, mempool.TxInfo{
 			SenderID: node.mempoolIDs.GetForPeer(peerID),
 		})
-		assert.NoError(err)
+		assert.NoError(t, err)
 	}
+
 }
 
 // verifyMempoolSize checks if the mempool size is as expected
-func verifyMempoolSize(node *FullNode, assert *assert.Assertions) {
-	assert.NoError(testutils.Retry(300, 100*time.Millisecond, func() error {
+func verifyMempoolSize(node *FullNode, t *testing.T) {
+	assert.NoError(t, testutils.Retry(300, 100*time.Millisecond, func() error {
 		expectedSize := uint64(4 * len("tx*"))
 		actualSize := uint64(node.Mempool.SizeBytes())
 		if expectedSize == actualSize {
