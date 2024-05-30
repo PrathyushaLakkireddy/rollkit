@@ -45,13 +45,13 @@ func TestLightClient_Panics(t *testing.T) {
 		{
 			name: "BroadcastTxCommit",
 			fn: func() {
-				_, _ = ln.GetClient().BroadcastTxSync(ctx, []byte{})
+				_, _ = ln.GetClient().BroadcastTxCommit(ctx, []byte{})
 			},
 		},
 		{
 			name: "BroadcastTxAsync",
 			fn: func() {
-				_, _ = ln.GetClient().BroadcastTxSync(ctx, []byte{})
+				_, _ = ln.GetClient().BroadcastTxAsync(ctx, []byte{})
 			},
 		},
 		{
