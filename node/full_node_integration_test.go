@@ -95,6 +95,8 @@ func TestTxGossipingAndAggregation(t *testing.T) {
 	aggCtx := context.Background()
 	ctx := context.Background()
 	nodes, apps := createNodes(aggCtx, ctx, clientNodes+1, getBMConfig(), types.TestChainID, t)
+	require.NotNil(apps) // apps should not be empty
+
 	startNodes(nodes, apps, t)
 	defer func() {
 		for _, n := range nodes {
